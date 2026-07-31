@@ -1,7 +1,25 @@
 mod storage;
+mod network;
+
+use network::server::Server;
 
 fn main() {
     println!("raftkv starting...");
+
+    // Start the server on port 6380 (not 6379, to avoid
+    // conflicting with any real Redis that might be running)
+    let mut server = match Server::new("127.0.0.1:6380", "/tmp/raftkv-data") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to start server: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = server.run() {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
