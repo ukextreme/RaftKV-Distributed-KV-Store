@@ -1,5 +1,6 @@
 mod storage;
 mod network;
+mod raft;
 
 use network::server::Server;
 
@@ -181,5 +182,104 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_raft_log_operations() {
+        use crate::raft::log::{LogCommand, LogEntry, RaftLog};
+
+        let mut log = RaftLog::new();
+
+        // Fresh log has just the sentinel
+        assert_eq!(log.last_index(), 0);
+        assert_eq!(log.last_term(), 0);
+        assert_eq!(log.len(), 0);
+
+        // Append an entry at term 1
+        let idx = log.append(LogEntry {
+            term: 1,
+            command: LogCommand::Put {
+                key: "name".to_string(),
+                value: "uday".to_string(),
+            },
+        });
+        assert_eq!(idx, 1);              // First real entry is at index 1
+        assert_eq!(log.last_index(), 1);
+        assert_eq!(log.last_term(), 1);
+        assert_eq!(log.len(), 1);
+
+        // Append another at term 1
+        log.append(LogEntry {
+            term: 1,
+            command: LogCommand::Put {
+                key: "balance".to_string(),
+                value: "5000".to_string(),
+            },
+        });
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(log.len(), 2);
+
+        // Append one at term 2 (new leader)
+        log.append(LogEntry {
+            term: 2,
+            command: LogCommand::Delete {
+                key: "name".to_string(),
+            },
+        });
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.last_term(), 2);
+
+        // term_at works correctly
+        assert_eq!(log.term_at(0), 0);  // sentinel
+        assert_eq!(log.term_at(1), 1);
+        assert_eq!(log.term_at(2), 1);
+        assert_eq!(log.term_at(3), 2);
+        assert_eq!(log.term_at(99), 0); // out of bounds = 0
+
+        // entries_from returns the right slice
+        let from_2 = log.entries_from(2);
+        assert_eq!(from_2.len(), 2); // entries at index 2 and 3
+
+        // Truncate from index 3 — removes entry at index 3
+        log.truncate_from(3);
+        assert_eq!(log.last_index(), 2);
+        assert_eq!(log.last_term(), 1); // back to term 1
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn test_raft_state_transitions() {
+        use crate::raft::state::{NodeRole, RaftState};
+
+        let mut state = RaftState::new(1, vec![1, 2, 3]);
+
+        // Starts as follower, term 0
+        assert_eq!(state.role, NodeRole::Follower);
+        assert_eq!(state.current_term, 0);
+        assert_eq!(state.voted_for, None);
+
+        // Become candidate — term increments, votes for self
+        state.become_candidate();
+        assert_eq!(state.role, NodeRole::Candidate);
+        assert_eq!(state.current_term, 1);
+        assert_eq!(state.voted_for, Some(1)); // voted for self
+
+        // Win election — become leader
+        state.become_leader();
+        assert_eq!(state.role, NodeRole::Leader);
+        assert_eq!(state.leader_id, Some(1));
+        // next_index initialized for peers 2 and 3
+        assert_eq!(state.next_index.len(), 2);
+        assert_eq!(state.match_index.len(), 2);
+
+        // Discover higher term — step down to follower
+        state.become_follower(5);
+        assert_eq!(state.role, NodeRole::Follower);
+        assert_eq!(state.current_term, 5);
+        assert_eq!(state.voted_for, None); // vote cleared for new term
+        assert!(state.next_index.is_empty()); // leader state cleared
+
+        // Majority of 3 nodes = 2
+        assert_eq!(state.majority_count(), 2);
     }
 }
