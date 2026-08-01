@@ -1,10 +1,11 @@
+use serde::{Serialize, Deserialize};
 /// A single entry in the Raft log.
 ///
 /// Every operation that changes the database becomes a log entry.
 /// The entry records WHAT to do (the command) and WHEN it was
 /// proposed (the term). The term is crucial for Raft's safety —
 /// it tells you which leader created this entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogEntry {
     /// The term when this entry was created by the leader.
     /// Used to detect stale entries and resolve conflicts.
@@ -18,7 +19,7 @@ pub struct LogEntry {
 
 /// The command stored in a log entry.
 /// This is what actually gets applied to the storage engine.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogCommand {
     /// Store a key-value pair
     Put { key: String, value: String },
@@ -151,5 +152,27 @@ impl RaftLog {
     pub fn len(&self) -> usize {
         // Subtract 1 for the sentinel
         self.entries.len() - 1
+    }
+
+    /// Reconstruct a RaftLog from a saved vector of entries.
+    ///
+    /// Used during recovery: the persister saves the raw Vec<LogEntry>,
+    /// and on restart we rebuild the RaftLog from it.
+    pub fn from_entries(entries: Vec<LogEntry>) -> Self {
+        // If the saved entries are empty (shouldn't happen, but defensive),
+        // create a fresh log with just the sentinel.
+        if entries.is_empty() {
+            return RaftLog::new();
+        }
+
+        RaftLog { entries }
+    }
+
+    /// Get all entries as a Vec for persistence.
+    ///
+    /// Returns a clone of the internal entries vector.
+    /// Called when saving state to disk.
+    pub fn to_entries(&self) -> Vec<LogEntry> {
+        self.entries.clone()
     }
 }

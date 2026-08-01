@@ -527,4 +527,78 @@ mod tests {
         });
         assert!(result.is_none()); // Followers can't propose
     }
+    #[test]
+    fn test_raft_persistence() {
+        use crate::raft::log::{LogCommand, LogEntry};
+        use crate::raft::node::RaftNode;
+        use crate::raft::state::NodeRole;
+        use std::fs;
+
+        let test_dir = "/tmp/test_raft_persist";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let peers = vec![1, 2, 3];
+
+        // === FIRST LIFETIME: create node, start election, add entries ===
+        {
+            let mut node = RaftNode::with_persistence(1, peers.clone(), test_dir)
+                .expect("Failed to create node");
+
+            // Tick until election starts
+            for _ in 0..25 {
+                let actions = node.tick();
+                if !actions.is_empty() {
+                    break;
+                }
+            }
+
+            assert_eq!(node.state.current_term, 1);
+            assert_eq!(node.state.voted_for, Some(1));
+
+            // Manually become leader and add a log entry
+            node.state.become_leader();
+            node.state.log.append(LogEntry {
+                term: 1,
+                command: LogCommand::Put {
+                    key: "name".to_string(),
+                    value: "uday".to_string(),
+                },
+            });
+
+            // Save the state (normally done by handler methods,
+            // but we modified state directly here)
+            node.persist_for_test();
+        }
+        // Node dropped — simulates crash. Memory wiped.
+
+        // === SECOND LIFETIME: recover from disk ===
+        {
+            let node = RaftNode::with_persistence(1, peers.clone(), test_dir)
+                .expect("Failed to recover node");
+
+            // Persistent state: restored
+            assert_eq!(node.state.current_term, 1);
+            assert_eq!(node.state.voted_for, Some(1));
+            assert_eq!(node.state.log.last_index(), 1);
+            assert_eq!(node.state.log.last_term(), 1);
+
+            // Check the actual log entry content
+            let entry = node.state.log.get(1).expect("Entry should exist");
+            assert_eq!(entry.term, 1);
+            match &entry.command {
+                LogCommand::Put { key, value } => {
+                    assert_eq!(key, "name");
+                    assert_eq!(value, "uday");
+                }
+                _ => panic!("Expected Put command"),
+            }
+
+            // Volatile state: reset to defaults
+            assert_eq!(node.state.role, NodeRole::Follower);
+            assert_eq!(node.state.commit_index, 0);
+            assert_eq!(node.state.last_applied, 0);
+        }
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
 }

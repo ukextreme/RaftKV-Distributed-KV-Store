@@ -6,7 +6,8 @@ use super::message::{
     RequestVoteRequest, RequestVoteResponse,
 };
 use super::state::{NodeRole, RaftState};
-
+use super::persist::{PersistentState, StatePersister};
+use std::path::Path;
 /// An action the Raft node wants the outside world to perform.
 ///
 /// The node itself doesn't send network messages or write to disk —
@@ -62,6 +63,8 @@ pub struct RaftNode {
     /// All persistent and volatile Raft state.
     pub state: RaftState,
 
+    /// Handles saving/loading persistent state to disk.
+    persister: Option<StatePersister>,
     /// Ticks remaining until election timeout fires.
     /// When this reaches 0, a follower/candidate starts an election.
     /// Reset whenever we hear from the leader (heartbeat or AppendEntries).
@@ -88,17 +91,61 @@ pub struct RaftNode {
 
 impl RaftNode {
     /// Create a new Raft node.
+    /// Create a new Raft node without persistence (for testing).
     pub fn new(id: u64, peers: Vec<u64>) -> Self {
         let mut node = RaftNode {
             state: RaftState::new(id, peers),
+            persister: None,
             election_timeout: 0,
             election_timeout_duration: 0,
             heartbeat_timeout: HEARTBEAT_INTERVAL,
             votes_received: HashSet::new(),
-            random_seed: id, // Seed with node ID so each node gets different timeouts
+            random_seed: id,
         };
         node.reset_election_timeout();
         node
+    }
+
+    /// Create a new Raft node with persistence.
+    ///
+    /// If a saved state exists at the given path, it's loaded
+    /// and the node resumes from where it left off. Otherwise,
+    /// the node starts fresh.
+    pub fn with_persistence<P: AsRef<Path>>(
+        id: u64,
+        peers: Vec<u64>,
+        data_dir: P,
+    ) -> std::io::Result<Self> {
+        let data_dir = data_dir.as_ref();
+        std::fs::create_dir_all(data_dir)?;
+
+        let persist_path = data_dir.join(format!("raft_state_{}.json", id));
+        let persister = StatePersister::new(&persist_path);
+
+        let mut node = RaftNode {
+            state: RaftState::new(id, peers),
+            persister: Some(persister),
+            election_timeout: 0,
+            election_timeout_duration: 0,
+            heartbeat_timeout: HEARTBEAT_INTERVAL,
+            votes_received: HashSet::new(),
+            random_seed: id,
+        };
+
+        // Try to load saved state
+        if let Some(ref p) = node.persister {
+            if let Ok(Some(saved)) = p.load() {
+                // Restore persistent fields
+                node.state.current_term = saved.current_term;
+                node.state.voted_for = saved.voted_for;
+
+                // Rebuild the log from saved entries
+                node.state.log = super::log::RaftLog::from_entries(saved.log);
+            }
+        }
+
+        node.reset_election_timeout();
+        Ok(node)
     }
 
     /// Generate a pseudo-random election timeout between MIN and MAX.
@@ -193,7 +240,8 @@ impl RaftNode {
         // Reset the timeout — if this election fails (vote split),
         // we'll wait a new random duration before trying again
         self.reset_election_timeout();
-
+        // Persist: term incremented, voted for self
+        self.persist();
         let mut actions = Vec::new();
 
         // Check if we're the only node (single-node cluster)
@@ -273,6 +321,7 @@ impl RaftNode {
         // term immediately steps down, regardless of its current role.
         if request.term > self.state.current_term {
             self.state.become_follower(request.term);
+            self.persist();
         }
 
         // Rule 2: Check if we can vote for this candidate.
@@ -313,6 +362,7 @@ impl RaftNode {
             // Reset election timeout — we just heard from a valid
             // candidate, so don't start our own election
             self.reset_election_timeout();
+            self.persist();
         }
 
         actions.push(Action::SendRequestVoteResponse {
@@ -345,6 +395,7 @@ impl RaftNode {
         // Step down immediately.
         if response.term > self.state.current_term {
             self.state.become_follower(response.term);
+            self.persist();
             return Vec::new();
         }
 
@@ -412,7 +463,7 @@ impl RaftNode {
         // Reset election timeout — we heard from the leader,
         // so don't start an unnecessary election.
         self.reset_election_timeout();
-
+        self.persist();
         // === LOG CONSISTENCY CHECK ===
         // Verify that our log matches the leader's at prev_log_index.
         // If it doesn't, our logs have diverged and we reject.
@@ -470,6 +521,7 @@ impl RaftNode {
 
             if !new_entries.is_empty() {
                 self.state.log.append_entries(new_entries);
+                self.persist(); 
             }
         }
 
@@ -551,6 +603,7 @@ impl RaftNode {
         // If the follower has a higher term, step down
         if response.term > self.state.current_term {
             self.state.become_follower(response.term);
+            self.persist();
             return Vec::new();
         }
 
@@ -674,7 +727,7 @@ impl RaftNode {
             command,
         };
         self.state.log.append(entry);
-
+        self.persist();
         // Immediately replicate to all followers
         // Don't wait for the next heartbeat — latency matters
         let actions = self.replicate_to_all_peers();
@@ -743,5 +796,37 @@ impl RaftNode {
                 leader_commit: self.state.commit_index,
             },
         })
+    }
+    /// Save persistent state to disk (if persistence is enabled).
+    ///
+    /// Called after any change to:
+    ///   - current_term
+    ///   - voted_for
+    ///   - log
+    ///
+    /// Silently does nothing if no persister is configured (testing mode).
+    fn persist(&self) {
+        if let Some(ref persister) = self.persister {
+            let state = PersistentState {
+                current_term: self.state.current_term,
+                voted_for: self.state.voted_for,
+                log: self.state.log.to_entries(),
+            };
+
+            if let Err(e) = persister.save(&state) {
+                // In a production system, a persistence failure is fatal —
+                // the node should stop rather than risk violating safety.
+                // For now, we log the error and continue.
+                eprintln!("WARNING: Failed to persist state: {}", e);
+            }
+        }
+    }
+    /// Public wrapper around persist() for testing.
+    /// In production, persist() is called automatically by the
+    /// handler methods. In tests where we manually modify state,
+    /// we need to trigger persistence explicitly.
+    #[cfg(test)]
+    pub fn persist_for_test(&self) {
+        self.persist();
     }
 }
