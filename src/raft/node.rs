@@ -229,28 +229,14 @@ impl RaftNode {
     /// Heartbeats serve two purposes:
     /// 1. Prevent followers from starting unnecessary elections
     /// 2. Carry the leader's commit_index so followers can advance theirs
+    /// Send heartbeats (with any pending entries) to all followers.
+    ///
+    /// This replaces the old send_heartbeats that always sent empty
+    /// messages. Now it sends whatever entries each follower needs.
+    /// If a follower is fully caught up, the entries list will be
+    /// empty — which is exactly a heartbeat.
     fn send_heartbeats(&self) -> Vec<Action> {
-        let mut actions = Vec::new();
-
-        for &peer_id in &self.state.peers {
-            if peer_id == self.state.id {
-                continue;
-            }
-
-            actions.push(Action::SendAppendEntries {
-                to: peer_id,
-                request: AppendEntriesRequest {
-                    term: self.state.current_term,
-                    leader_id: self.state.id,
-                    prev_log_index: self.state.log.last_index(),
-                    prev_log_term: self.state.log.last_term(),
-                    entries: Vec::new(), // Empty = heartbeat
-                    leader_commit: self.state.commit_index,
-                },
-            });
-        }
-
-        actions
+        self.replicate_to_all_peers()
     }
 
     /// Handle an incoming RequestVote request.
@@ -662,5 +648,100 @@ impl RaftNode {
         }
 
         Vec::new()
+    }
+
+    /// Propose a new command to the cluster.
+    ///
+    /// Only the leader can accept proposals. The command is:
+    /// 1. Appended to the leader's log
+    /// 2. Immediately sent to all followers for replication
+    ///
+    /// The command is NOT committed yet — it's only committed once
+    /// a majority of nodes have replicated it. The caller should
+    /// wait for the ApplyEntry action to know it's safe.
+    ///
+    /// Returns actions (AppendEntries to send to followers).
+    /// Returns None if this node is not the leader.
+    pub fn propose(&mut self, command: LogCommand) -> Option<Vec<Action>> {
+        // Only leaders can accept proposals
+        if self.state.role != NodeRole::Leader {
+            return None;
+        }
+
+        // Append the command to our log with the current term
+        let entry = LogEntry {
+            term: self.state.current_term,
+            command,
+        };
+        self.state.log.append(entry);
+
+        // Immediately replicate to all followers
+        // Don't wait for the next heartbeat — latency matters
+        let actions = self.replicate_to_all_peers();
+
+        Some(actions)
+    }
+
+    /// Send pending log entries to all followers.
+    ///
+    /// For each follower, checks next_index to determine which
+    /// entries they need, and sends an AppendEntries with those entries.
+    /// If a follower is fully caught up, this sends an empty
+    /// AppendEntries (a heartbeat).
+    fn replicate_to_all_peers(&self) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        for &peer_id in &self.state.peers {
+            if peer_id == self.state.id {
+                continue;
+            }
+
+            if let Some(action) = self.replicate_to_peer(peer_id) {
+                actions.push(action);
+            }
+        }
+
+        actions
+    }
+
+    /// Send pending log entries to a specific follower.
+    ///
+    /// Looks up next_index for this follower to determine:
+    /// - prev_log_index and prev_log_term (for the consistency check)
+    /// - which entries to send (everything from next_index onwards)
+    ///
+    /// Returns None if the peer isn't found in our tracking arrays
+    /// (shouldn't happen, but defensive programming).
+    fn replicate_to_peer(&self, peer_id: u64) -> Option<Action> {
+        // Find next_index for this peer
+        // .iter() gives us references to the (id, index) tuples
+        // .find() returns the first element matching the condition
+        // It returns Option<&(u64, usize)> — None if not found
+        let next_idx = self.state.next_index
+            .iter()
+            .find(|(id, _)| *id == peer_id)
+            .map(|(_, idx)| *idx)?;
+
+        // prev_log_index is the entry just before what we're sending
+        // next_idx is where we start sending, so prev is next_idx - 1
+        let prev_log_index = if next_idx > 0 { next_idx - 1 } else { 0 };
+        let prev_log_term = self.state.log.term_at(prev_log_index);
+
+        // Get the entries to send: everything from next_idx onwards
+        // .to_vec() makes a copy — we need to own the entries to put
+        // them in the message, but the log retains its copy too
+        let entries = self.state.log.entries_from(next_idx).to_vec();
+
+        Some(Action::SendAppendEntries {
+            to: peer_id,
+            request: AppendEntriesRequest {
+                term: self.state.current_term,
+                leader_id: self.state.id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: self.state.commit_index,
+            },
+        })
     }
 }

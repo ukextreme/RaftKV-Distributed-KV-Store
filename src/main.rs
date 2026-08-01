@@ -358,4 +358,173 @@ mod tests {
         assert_eq!(node3.state.role, NodeRole::Follower);
         assert_eq!(node3.state.current_term, 1);
     }
+
+    #[test]
+    fn test_log_replication() {
+        use crate::raft::log::LogCommand;
+        use crate::raft::node::{Action, RaftNode};
+        use crate::raft::state::NodeRole;
+
+        // === SETUP: elect node1 as leader ===
+        let peers = vec![1, 2, 3];
+        let mut node1 = RaftNode::new(1, peers.clone());
+        let mut node2 = RaftNode::new(2, peers.clone());
+        let mut node3 = RaftNode::new(3, peers.clone());
+
+        // Fast-forward node1 to become leader
+        // (We tested election in detail already; here we just
+        //  set it up quickly to test replication)
+
+        // Tick node1 until it starts an election
+        let mut vote_requests = Vec::new();
+        for _ in 0..25 {
+            let actions = node1.tick();
+            if !actions.is_empty() {
+                vote_requests = actions;
+                break;
+            }
+        }
+        assert_eq!(node1.state.role, NodeRole::Candidate);
+
+        // Deliver votes from node2 and node3
+        for action in &vote_requests {
+            if let Action::SendRequestVote { to, request } = action {
+                let responses = if *to == 2 {
+                    node2.handle_request_vote(request.clone())
+                } else {
+                    node3.handle_request_vote(request.clone())
+                };
+
+                for resp_action in &responses {
+                    if let Action::SendRequestVoteResponse { response, .. } = resp_action {
+                        node1.handle_request_vote_response(*to, response.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(node1.state.role, NodeRole::Leader);
+
+        // === TEST: propose a write and replicate it ===
+
+        // Client sends: SET name uday
+        let actions = node1.propose(LogCommand::Put {
+            key: "name".to_string(),
+            value: "uday".to_string(),
+        }).expect("Leader should accept proposal");
+
+        // The leader should send AppendEntries to both followers
+        assert_eq!(actions.len(), 2);
+
+        // Verify the leader's log has the entry
+        assert_eq!(node1.state.log.last_index(), 1);
+        assert_eq!(node1.state.log.last_term(), 1);
+
+        // Entry is NOT committed yet — only the leader has it
+        assert_eq!(node1.state.commit_index, 0);
+
+        // === Deliver AppendEntries to followers ===
+
+        let mut all_response_actions = Vec::new();
+
+        for action in &actions {
+            if let Action::SendAppendEntries { to, request } = action {
+                let response_actions = if *to == 2 {
+                    node2.handle_append_entries(request.clone())
+                } else {
+                    node3.handle_append_entries(request.clone())
+                };
+
+                // Each follower should accept and respond
+                for resp_action in response_actions {
+                    all_response_actions.push((*to, resp_action));
+                }
+            }
+        }
+
+        // Verify followers have the entry in their logs
+        assert_eq!(node2.state.log.last_index(), 1);
+        assert_eq!(node3.state.log.last_index(), 1);
+
+        // === Deliver responses back to leader ===
+
+        let mut apply_actions = Vec::new();
+
+        for (from, action) in &all_response_actions {
+            if let Action::SendAppendEntriesResponse { response, .. } = action {
+                let leader_actions = node1.handle_append_entries_response(
+                    *from,
+                    response.clone(),
+                );
+
+                // Collect any ApplyEntry actions
+                for a in leader_actions {
+                    if matches!(&a, Action::ApplyEntry { .. }) {
+                        apply_actions.push(a);
+                    }
+                }
+            }
+        }
+
+        // === Verify: entry is now committed ===
+
+        // Leader's commit_index should have advanced to 1
+        assert_eq!(node1.state.commit_index, 1);
+
+        // The leader should have produced an ApplyEntry action
+        assert!(!apply_actions.is_empty());
+
+        // Verify the apply action contains the right command
+        if let Action::ApplyEntry { index, command } = &apply_actions[0] {
+            assert_eq!(*index, 1);
+            match command {
+                LogCommand::Put { key, value } => {
+                    assert_eq!(key, "name");
+                    assert_eq!(value, "uday");
+                }
+                _ => panic!("Expected Put command"),
+            }
+        } else {
+            panic!("Expected ApplyEntry action");
+        }
+
+        // === TEST: propose a second write ===
+
+        let actions = node1.propose(LogCommand::Put {
+            key: "balance".to_string(),
+            value: "5000".to_string(),
+        }).expect("Leader should accept proposal");
+
+        // Deliver to node2 only (node3 is "slow" / partitioned)
+        for action in &actions {
+            if let Action::SendAppendEntries { to, request } = action {
+                if *to == 2 {
+                    let responses = node2.handle_append_entries(request.clone());
+
+                    for resp_action in &responses {
+                        if let Action::SendAppendEntriesResponse { response, .. } = resp_action {
+                            node1.handle_append_entries_response(2, response.clone());
+                        }
+                    }
+                }
+                // Skip node3 — simulating it being slow/unreachable
+            }
+        }
+
+        // Should STILL commit — node1 + node2 = 2 out of 3 = majority
+        assert_eq!(node1.state.commit_index, 2);
+
+        // Node2 has both entries
+        assert_eq!(node2.state.log.last_index(), 2);
+
+        // Node3 still only has the first entry
+        assert_eq!(node3.state.log.last_index(), 1);
+
+        // === Verify: non-leader cannot propose ===
+
+        let result = node2.propose(LogCommand::Put {
+            key: "test".to_string(),
+            value: "fail".to_string(),
+        });
+        assert!(result.is_none()); // Followers can't propose
+    }
 }
