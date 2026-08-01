@@ -282,4 +282,80 @@ mod tests {
         // Majority of 3 nodes = 2
         assert_eq!(state.majority_count(), 2);
     }
+
+    #[test]
+    fn test_leader_election() {
+        use crate::raft::node::{Action, RaftNode};
+        use crate::raft::state::NodeRole;
+        use crate::raft::message::RequestVoteResponse;
+
+        // Create a 3-node cluster
+        let peers = vec![1, 2, 3];
+        let mut node1 = RaftNode::new(1, peers.clone());
+        let mut node2 = RaftNode::new(2, peers.clone());
+        let mut node3 = RaftNode::new(3, peers.clone());
+
+        // All start as followers
+        assert_eq!(node1.state.role, NodeRole::Follower);
+        assert_eq!(node2.state.role, NodeRole::Follower);
+        assert_eq!(node3.state.role, NodeRole::Follower);
+
+        // Tick node1 until it times out and starts an election.
+        // We tick up to 25 times (max timeout is 20).
+        let mut election_actions = Vec::new();
+        for _ in 0..25 {
+            let actions = node1.tick();
+            if !actions.is_empty() {
+                election_actions = actions;
+                break;
+            }
+        }
+
+        // Node1 should be a candidate now
+        assert_eq!(node1.state.role, NodeRole::Candidate);
+        assert_eq!(node1.state.current_term, 1);
+
+        // It should have sent RequestVote to nodes 2 and 3
+        assert_eq!(election_actions.len(), 2);
+
+        // Extract the vote requests and deliver them
+        for action in &election_actions {
+            match action {
+                Action::SendRequestVote { to, request } => {
+                    // Deliver the vote request to the target node
+                    let response_actions = if *to == 2 {
+                        node2.handle_request_vote(request.clone())
+                    } else {
+                        node3.handle_request_vote(request.clone())
+                    };
+
+                    // Each should respond with a vote
+                    assert_eq!(response_actions.len(), 1);
+
+                    // Deliver the response back to node1
+                    if let Action::SendRequestVoteResponse { response, .. } =
+                        &response_actions[0]
+                    {
+                        assert!(response.vote_granted);
+                        node1.handle_request_vote_response(
+                            *to,
+                            response.clone(),
+                        );
+                    }
+                }
+                _ => panic!("Expected SendRequestVote action"),
+            }
+        }
+
+        // Node1 should now be the leader!
+        assert_eq!(node1.state.role, NodeRole::Leader);
+        assert_eq!(node1.state.current_term, 1);
+        assert_eq!(node1.state.leader_id, Some(1));
+
+        // Nodes 2 and 3 should be followers at term 1
+        assert_eq!(node2.state.role, NodeRole::Follower);
+        assert_eq!(node2.state.current_term, 1);
+        assert_eq!(node3.state.role, NodeRole::Follower);
+        assert_eq!(node3.state.current_term, 1);
+    }
 }
