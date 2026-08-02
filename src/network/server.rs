@@ -1,55 +1,104 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use crate::storage::engine::StorageEngine;
+use crate::cluster::ClusterNode;
 use super::protocol::{Command, Response};
 
 /// The database server.
-/// Listens on a TCP port and handles client connections,
-/// translating RESP commands into storage engine operations.
+///
+/// Manages client connections and a background tick thread.
+/// The ClusterNode is shared between the main thread (handling
+/// client commands) and the tick thread (driving Raft elections
+/// and heartbeats) via Arc<Mutex<>>.
 pub struct Server {
-    storage: StorageEngine,
+    /// The cluster node, shared between threads.
+    ///
+    /// Arc = Atomic Reference Count: allows multiple threads to
+    ///       own the same data. When the last Arc is dropped,
+    ///       the data is freed.
+    /// Mutex = Mutual Exclusion: only one thread can access the
+    ///         inner data at a time. .lock() acquires access,
+    ///         and the lock is released when the guard is dropped.
+    ///
+    /// Together, Arc<Mutex<T>> is THE standard Rust pattern for
+    /// "shared mutable state across threads."
+    node: Arc<Mutex<ClusterNode>>,
     addr: String,
 }
 
-
 impl Server {
-    /// Create a new server backed by a storage engine at the given directory.
-    pub fn new(addr: &str, data_dir: &str) -> std::io::Result<Self> {
-        let storage = StorageEngine::new(data_dir)?;
+    /// Create a new server backed by a cluster node.
+    pub fn new(
+        node_id: u64,
+        peers: Vec<u64>,
+        addr: &str,
+        data_dir: &str,
+    ) -> std::io::Result<Self> {
+        let cluster_node = ClusterNode::new(node_id, peers, data_dir)?;
+
         Ok(Server {
-            storage,
+            node: Arc::new(Mutex::new(cluster_node)),
             addr: addr.to_string(),
         })
     }
 
-    /// Start listening for connections and handle them.
-    ///
-    /// This function runs forever (until the process is killed).
-    /// It accepts one connection at a time — a real database would
-    /// use threads or async I/O to handle many clients concurrently,
-    /// but single-threaded is correct and simple for now.
-    pub fn run(&mut self) -> std::io::Result<()> {
-        // Bind to the address and port.
-        // TcpListener::bind is like calling socket() + bind() + listen()
-        // in C — Rust combines them into one call.
+    /// Start the server: tick thread + client accept loop.
+    pub fn run(&self) -> std::io::Result<()> {
+        // === START THE TICK THREAD ===
+
+        // Arc::clone creates a new reference to the same data.
+        // It doesn't copy the ClusterNode — it increments the
+        // reference count. Both `tick_node` and `self.node` point
+        // at the same Mutex<ClusterNode>.
+        let tick_node = Arc::clone(&self.node);
+
+        // thread::spawn creates a new OS thread.
+        // The `move` keyword transfers ownership of `tick_node`
+        // into the closure — the new thread now owns its Arc handle.
+        // Without `move`, the closure would try to borrow from
+        // the current scope, which doesn't live long enough.
+        thread::spawn(move || {
+            loop {
+                // Sleep for 50ms between ticks.
+                // This means our "tick" unit is ~50ms.
+                // Election timeout of 10-20 ticks = 500ms-1000ms.
+                // Heartbeat interval of 3 ticks = 150ms.
+                thread::sleep(Duration::from_millis(50));
+
+                // Lock the mutex to get exclusive access.
+                // .lock() returns a Result — it can fail if another
+                // thread panicked while holding the lock (a "poisoned"
+                // mutex). .unwrap() crashes on poison; in production
+                // you'd handle this more gracefully.
+                let mut node = tick_node.lock().unwrap();
+
+                // Tick the Raft node
+                node.tick();
+
+                // In M3f, we'd also drain and deliver outbound messages here.
+                // For now, single-node, there are no peers to send to.
+            }
+            // Lock is automatically released here when `node` goes out of scope.
+            // This is RAII — the same principle as your WAL file handles.
+        });
+
+        // === START THE CLIENT ACCEPT LOOP ===
+
         let listener = TcpListener::bind(&self.addr)?;
         println!("raftkv server listening on {}", self.addr);
 
-        // .incoming() returns an iterator of new connections.
-        // Each time a client connects, this yields a new TcpStream.
-        // It blocks (waits) when no client is connecting.
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    // Get the client's address for logging
                     let addr = stream
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "unknown".to_string());
                     println!("Client connected: {}", addr);
 
-                    // Handle this client's commands until they disconnect
                     self.handle_client(stream);
 
                     println!("Client disconnected: {}", addr);
@@ -64,19 +113,7 @@ impl Server {
     }
 
     /// Handle a single client connection.
-    ///
-    /// Reads commands in a loop, processes each one, and sends
-    /// the response back. Runs until the client disconnects.
-    fn handle_client(&mut self, stream: TcpStream) {
-        // BufReader wraps the TCP stream and adds buffered reading.
-        // .lines() will give us one complete line at a time.
-        // But RESP is multi-line, so we need to read raw lines
-        // and accumulate them into complete messages.
-
-        // We clone the stream because we need one handle for reading
-        // (wrapped in BufReader) and one for writing. try_clone()
-        // creates a second handle to the same underlying connection —
-        // like dup() in C. Both handles refer to the same socket.
+    fn handle_client(&self, stream: TcpStream) {
         let reader_stream = match stream.try_clone() {
             Ok(s) => s,
             Err(e) => {
@@ -88,29 +125,20 @@ impl Server {
         let reader = BufReader::new(reader_stream);
         let mut writer = stream;
         let mut lines_iter = reader.lines();
-        
-        // Main command loop: read and process commands until disconnection
+
         loop {
-            // Read the first line of a RESP message
-            // .lines() returns Option<Result<String, Error>>:
-            //   None → client disconnected (stream closed)
-            //   Some(Err(...)) → read error
-            //   Some(Ok(line)) → a line of text
             let first_line = match lines_iter.next() {
                 Some(Ok(line)) => line,
-                Some(Err(_)) => break,   // Read error — disconnect
-                None => break,           // Client disconnected
+                Some(Err(_)) => break,
+                None => break,
             };
 
-            // Parse the RESP message starting from this first line
             if !first_line.starts_with('*') {
-                // Not a RESP array — skip it
                 let response = Response::Error("invalid protocol".to_string());
                 let _ = writer.write_all(response.serialize().as_bytes());
                 continue;
             }
 
-            // Read the number of arguments
             let num_args: usize = match first_line[1..].parse() {
                 Ok(n) => n,
                 Err(_) => {
@@ -120,12 +148,10 @@ impl Server {
                 }
             };
 
-            // Read all the argument pairs ($len + data)
             let mut args: Vec<String> = Vec::new();
             let mut parse_failed = false;
 
             for _ in 0..num_args {
-                // Read the $<len> line
                 let len_line = match lines_iter.next() {
                     Some(Ok(line)) => line,
                     _ => { parse_failed = true; break; }
@@ -136,7 +162,6 @@ impl Server {
                     break;
                 }
 
-                // Read the data line
                 let data = match lines_iter.next() {
                     Some(Ok(line)) => line,
                     _ => { parse_failed = true; break; }
@@ -151,7 +176,6 @@ impl Server {
                 continue;
             }
 
-            // Build the command from parsed arguments
             let command_name = args[0].to_uppercase();
             let command = match command_name.as_str() {
                 "GET" if args.len() == 2 => Command::Get {
@@ -170,47 +194,21 @@ impl Server {
                 },
             };
 
-            // Execute the command against the storage engine
-            let response = self.execute(command);
+            // === THE KEY CHANGE FROM M2 ===
+            // Instead of calling storage engine directly, we go
+            // through the ClusterNode, which routes through Raft.
+            let response = {
+                // Lock the mutex — this blocks if the tick thread
+                // currently holds the lock. The lock is released
+                // at the end of this block.
+                let mut node = self.node.lock().unwrap();
+                node.handle_client_command(command)
+            };
+            // Mutex released here — tick thread can proceed
 
-            // Send the response back to the client
             let serialized = response.serialize();
             if writer.write_all(serialized.as_bytes()).is_err() {
-                break; // Write failed — client probably disconnected
-            }
-        }
-    }
-
-    /// Execute a parsed command against the storage engine.
-    ///
-    /// This is where the network layer meets the storage layer.
-    /// Clean separation: the command is already parsed, the response
-    /// is just data — no networking concerns leak in here.
-    fn execute(&mut self, command: Command) -> Response {
-        match command {
-            Command::Get { key } => {
-                match self.storage.get(&key) {
-                    Some(value) => Response::BulkString(value),
-                    None => Response::Null,
-                }
-            }
-            Command::Set { key, value } => {
-                match self.storage.put(key, value) {
-                    Ok(()) => Response::SimpleString("OK".to_string()),
-                    Err(e) => Response::Error(format!("storage error: {}", e)),
-                }
-            }
-            Command::Del { key } => {
-                match self.storage.delete(key) {
-                    Ok(()) => Response::Integer(1),
-                    Err(e) => Response::Error(format!("storage error: {}", e)),
-                }
-            }
-            Command::Ping => {
-                Response::SimpleString("PONG".to_string())
-            }
-            Command::Unknown { name } => {
-                Response::Error(format!("unknown command '{}'", name))
+                break;
             }
         }
     }

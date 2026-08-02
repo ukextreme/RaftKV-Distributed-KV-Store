@@ -716,21 +716,26 @@ impl RaftNode {
     /// Returns actions (AppendEntries to send to followers).
     /// Returns None if this node is not the leader.
     pub fn propose(&mut self, command: LogCommand) -> Option<Vec<Action>> {
-        // Only leaders can accept proposals
         if self.state.role != NodeRole::Leader {
             return None;
         }
 
-        // Append the command to our log with the current term
         let entry = LogEntry {
             term: self.state.current_term,
             command,
         };
         self.state.log.append(entry);
         self.persist();
-        // Immediately replicate to all followers
-        // Don't wait for the next heartbeat — latency matters
-        let actions = self.replicate_to_all_peers();
+
+        let mut actions = self.replicate_to_all_peers();
+
+        // Check if we can commit immediately.
+        // In a single-node cluster, the leader alone is the majority,
+        // so entries commit without waiting for any responses.
+        // In a multi-node cluster, this usually does nothing here
+        // (we need follower responses first), but it's correct to check.
+        let commit_actions = self.maybe_advance_commit_index();
+        actions.extend(commit_actions);
 
         Some(actions)
     }

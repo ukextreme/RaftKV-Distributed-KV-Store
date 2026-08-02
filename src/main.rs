@@ -1,15 +1,22 @@
 mod storage;
 mod network;
 mod raft;
-
+mod cluster;
 use network::server::Server;
 
 fn main() {
     println!("raftkv starting...");
 
-    // Start the server on port 6380 (not 6379, to avoid
-    // conflicting with any real Redis that might be running)
-    let mut server = match Server::new("127.0.0.1:6380", "/tmp/raftkv-data") {
+    // Single-node cluster: node ID 1, only peer is itself
+    let node_id = 1;
+    let peers = vec![1];
+
+    let server = match Server::new(
+        node_id,
+        peers,
+        "127.0.0.1:6380",
+        "/tmp/raftkv-data",
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to start server: {}", e);
@@ -597,6 +604,93 @@ mod tests {
             assert_eq!(node.state.role, NodeRole::Follower);
             assert_eq!(node.state.commit_index, 0);
             assert_eq!(node.state.last_applied, 0);
+        }
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_cluster_node_single_node() {
+        use crate::cluster::ClusterNode;
+        use crate::network::protocol::{Command, Response};
+        use std::fs;
+
+        let test_dir = "/tmp/test_cluster_single";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let mut node = ClusterNode::new(1, vec![1], test_dir)
+            .expect("Failed to create cluster node");
+
+        // Tick until the node elects itself leader.
+        // Single-node cluster: should win immediately.
+        for _ in 0..25 {
+            node.tick();
+        }
+
+        assert_eq!(
+            node.raft.state.role,
+            crate::raft::state::NodeRole::Leader
+        );
+
+        // Now test client commands through the cluster node
+
+        // SET a key
+        let response = node.handle_client_command(Command::Set {
+            key: "name".to_string(),
+            value: "uday".to_string(),
+        });
+        match response {
+            Response::SimpleString(s) => assert_eq!(s, "OK"),
+            other => panic!("Expected OK, got {:?}", other),
+        }
+
+        // GET the key back
+        let response = node.handle_client_command(Command::Get {
+            key: "name".to_string(),
+        });
+        match response {
+            Response::BulkString(s) => assert_eq!(s, "uday"),
+            other => panic!("Expected BulkString, got {:?}", other),
+        }
+
+        // SET another key
+        node.handle_client_command(Command::Set {
+            key: "balance".to_string(),
+            value: "5000".to_string(),
+        });
+
+        // DEL the first key
+        let response = node.handle_client_command(Command::Del {
+            key: "name".to_string(),
+        });
+        match response {
+            Response::Integer(n) => assert_eq!(n, 1),
+            other => panic!("Expected Integer, got {:?}", other),
+        }
+
+        // GET deleted key — should be nil
+        let response = node.handle_client_command(Command::Get {
+            key: "name".to_string(),
+        });
+        match response {
+            Response::Null => {} // correct
+            other => panic!("Expected Null, got {:?}", other),
+        }
+
+        // GET the other key — should still exist
+        let response = node.handle_client_command(Command::Get {
+            key: "balance".to_string(),
+        });
+        match response {
+            Response::BulkString(s) => assert_eq!(s, "5000"),
+            other => panic!("Expected BulkString, got {:?}", other),
+        }
+
+        // PING
+        let response = node.handle_client_command(Command::Ping);
+        match response {
+            Response::SimpleString(s) => assert_eq!(s, "PONG"),
+            other => panic!("Expected PONG, got {:?}", other),
         }
 
         let _ = fs::remove_dir_all(test_dir);
