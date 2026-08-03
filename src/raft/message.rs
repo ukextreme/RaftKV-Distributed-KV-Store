@@ -1,3 +1,4 @@
+use serde::{Serialize, Deserialize};
 use super::log::LogEntry;
 
 // ============================================================
@@ -7,7 +8,7 @@ use super::log::LogEntry;
 // "I want to be leader. Here's my credentials. Vote for me?"
 
 /// The request a candidate sends to ask for votes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteRequest {
     /// The candidate's current term.
     /// If the receiver's term is higher, the candidate is stale
@@ -31,7 +32,7 @@ pub struct RequestVoteRequest {
 }
 
 /// The response to a vote request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteResponse {
     /// The receiver's current term.
     /// If higher than the candidate's term, the candidate
@@ -53,7 +54,7 @@ pub struct RequestVoteResponse {
 // 2. Without entries (empty): heartbeat to prevent elections
 
 /// The request a leader sends to replicate log entries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesRequest {
     /// The leader's current term.
     pub term: u64,
@@ -89,7 +90,7 @@ pub struct AppendEntriesRequest {
 }
 
 /// The response to an AppendEntries request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesResponse {
     /// The follower's current term.
     /// If higher than the leader's, the leader discovers it's

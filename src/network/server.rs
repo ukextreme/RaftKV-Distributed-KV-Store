@@ -5,103 +5,98 @@ use std::thread;
 use std::time::Duration;
 
 use crate::cluster::ClusterNode;
+use crate::transport::{NodeConfig, PeerTransport};
 use super::protocol::{Command, Response};
 
 /// The database server.
-///
-/// Manages client connections and a background tick thread.
-/// The ClusterNode is shared between the main thread (handling
-/// client commands) and the tick thread (driving Raft elections
-/// and heartbeats) via Arc<Mutex<>>.
 pub struct Server {
-    /// The cluster node, shared between threads.
-    ///
-    /// Arc = Atomic Reference Count: allows multiple threads to
-    ///       own the same data. When the last Arc is dropped,
-    ///       the data is freed.
-    /// Mutex = Mutual Exclusion: only one thread can access the
-    ///         inner data at a time. .lock() acquires access,
-    ///         and the lock is released when the guard is dropped.
-    ///
-    /// Together, Arc<Mutex<T>> is THE standard Rust pattern for
-    /// "shared mutable state across threads."
     node: Arc<Mutex<ClusterNode>>,
     addr: String,
+    transport: PeerTransport,
+    peer_port: u16,
+    node_id: u64,
 }
 
 impl Server {
-    /// Create a new server backed by a cluster node.
+    /// Create a new server for a multi-node cluster.
     pub fn new(
         node_id: u64,
         peers: Vec<u64>,
-        addr: &str,
+        client_addr: &str,
         data_dir: &str,
+        all_nodes: &[NodeConfig],
     ) -> std::io::Result<Self> {
         let cluster_node = ClusterNode::new(node_id, peers, data_dir)?;
 
+        let peer_port = all_nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .map(|n| n.peer_port)
+            .expect("Node ID not found in config");
+
+        let transport = PeerTransport::new(node_id, all_nodes);
+
         Ok(Server {
             node: Arc::new(Mutex::new(cluster_node)),
-            addr: addr.to_string(),
+            addr: client_addr.to_string(),
+            transport,
+            peer_port,
+            node_id,
         })
     }
 
-    /// Start the server: tick thread + client accept loop.
+    /// Start the server: peer listener + tick thread + client accept loop.
     pub fn run(&self) -> std::io::Result<()> {
-        // === START THE TICK THREAD ===
+        // === START THE PEER LISTENER ===
+        PeerTransport::start_listener(
+            self.node_id,
+            self.peer_port,
+            Arc::clone(&self.node),
+        )?;
 
-        // Arc::clone creates a new reference to the same data.
-        // It doesn't copy the ClusterNode — it increments the
-        // reference count. Both `tick_node` and `self.node` point
-        // at the same Mutex<ClusterNode>.
+        // === START THE TICK THREAD ===
         let tick_node = Arc::clone(&self.node);
 
-        // thread::spawn creates a new OS thread.
-        // The `move` keyword transfers ownership of `tick_node`
-        // into the closure — the new thread now owns its Arc handle.
-        // Without `move`, the closure would try to borrow from
-        // the current scope, which doesn't live long enough.
+        // We need to send outbound messages from the tick thread.
+        // Create a second transport for sending.
+        let peer_addresses: std::collections::HashMap<u64, String> = self.transport
+            .peer_addresses
+            .clone();
+        let tick_node_id = self.node_id;
+
         thread::spawn(move || {
+            // Create a transport for sending in this thread
+            let transport = PeerTransport::from_addresses(tick_node_id, peer_addresses);
+
             loop {
-                // Sleep for 50ms between ticks.
-                // This means our "tick" unit is ~50ms.
-                // Election timeout of 10-20 ticks = 500ms-1000ms.
-                // Heartbeat interval of 3 ticks = 150ms.
                 thread::sleep(Duration::from_millis(50));
 
-                // Lock the mutex to get exclusive access.
-                // .lock() returns a Result — it can fail if another
-                // thread panicked while holding the lock (a "poisoned"
-                // mutex). .unwrap() crashes on poison; in production
-                // you'd handle this more gracefully.
-                let mut node = tick_node.lock().unwrap();
+                let messages = {
+                    let mut node = tick_node.lock().unwrap();
+                    node.tick();
+                    node.take_outbound_messages()
+                };
+                // Lock is released here before sending over network.
+                // This is critical: sending over TCP can block, and
+                // we don't want to hold the mutex during network I/O.
 
-                // Tick the Raft node
-                node.tick();
-
-                // In M3f, we'd also drain and deliver outbound messages here.
-                // For now, single-node, there are no peers to send to.
+                if !messages.is_empty() {
+                    transport.send_messages(messages);
+                }
             }
-            // Lock is automatically released here when `node` goes out of scope.
-            // This is RAII — the same principle as your WAL file handles.
         });
 
         // === START THE CLIENT ACCEPT LOOP ===
-
         let listener = TcpListener::bind(&self.addr)?;
-        println!("raftkv server listening on {}", self.addr);
+        println!(
+            "Node {} client server on {}",
+            self.node_id, self.addr
+        );
 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let addr = stream
-                        .peer_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    println!("Client connected: {}", addr);
-
                     self.handle_client(stream);
-
-                    println!("Client disconnected: {}", addr);
                 }
                 Err(e) => {
                     eprintln!("Failed to accept connection: {}", e);
@@ -112,7 +107,6 @@ impl Server {
         Ok(())
     }
 
-    /// Handle a single client connection.
     fn handle_client(&self, stream: TcpStream) {
         let reader_stream = match stream.try_clone() {
             Ok(s) => s,
@@ -194,17 +188,21 @@ impl Server {
                 },
             };
 
-            // === THE KEY CHANGE FROM M2 ===
-            // Instead of calling storage engine directly, we go
-            // through the ClusterNode, which routes through Raft.
             let response = {
-                // Lock the mutex — this blocks if the tick thread
-                // currently holds the lock. The lock is released
-                // at the end of this block.
                 let mut node = self.node.lock().unwrap();
-                node.handle_client_command(command)
+
+                // Also send any outbound messages generated by
+                // client command processing
+                let resp = node.handle_client_command(command);
+                let messages = node.take_outbound_messages();
+                drop(node); // Release lock before network I/O
+
+                if !messages.is_empty() {
+                    self.transport.send_messages(messages);
+                }
+
+                resp
             };
-            // Mutex released here — tick thread can proceed
 
             let serialized = response.serialize();
             if writer.write_all(serialized.as_bytes()).is_err() {

@@ -142,7 +142,7 @@ impl ClusterNode {
     /// This is the bridge between Raft's pure logic and the real world:
     /// - ApplyEntry → execute against the storage engine
     /// - Send* → queue for delivery to peer nodes
-    fn process_actions(&mut self, actions: Vec<Action>) {
+    pub fn process_actions(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
                 Action::ApplyEntry { index: _, command } => {

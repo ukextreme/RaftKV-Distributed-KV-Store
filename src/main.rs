@@ -2,20 +2,54 @@ mod storage;
 mod network;
 mod raft;
 mod cluster;
+mod transport;
+
 use network::server::Server;
+use transport::NodeConfig;
 
 fn main() {
     println!("raftkv starting...");
 
-    // Single-node cluster: node ID 1, only peer is itself
-    let node_id = 1;
-    let peers = vec![1];
+    // Cluster configuration: 3 nodes on localhost
+    let all_nodes = vec![
+        NodeConfig { id: 1, client_port: 6381, peer_port: 7001 },
+        NodeConfig { id: 2, client_port: 6382, peer_port: 7002 },
+        NodeConfig { id: 3, client_port: 6383, peer_port: 7003 },
+    ];
+
+    let all_peer_ids: Vec<u64> = all_nodes.iter().map(|n| n.id).collect();
+
+    // Get node ID from command line: cargo run -- 1
+    let args: Vec<String> = std::env::args().collect();
+    let node_id: u64 = if args.len() > 1 {
+        args[1].parse().expect("Node ID must be a number (1, 2, or 3)")
+    } else {
+        // Default to single-node mode for backward compatibility
+        println!("Usage: cargo run -- <node_id>");
+        println!("Starting in single-node mode (node 1)...");
+        1
+    };
+
+    let node_config = all_nodes
+        .iter()
+        .find(|n| n.id == node_id)
+        .expect("Invalid node ID — must be 1, 2, or 3");
+
+    let client_addr = format!("127.0.0.1:{}", node_config.client_port);
+    let data_dir = format!("/tmp/raftkv-node-{}", node_id);
+
+    let peers = if args.len() > 1 {
+        all_peer_ids
+    } else {
+        vec![1] // Single-node mode
+    };
 
     let server = match Server::new(
         node_id,
         peers,
-        "127.0.0.1:6380",
-        "/tmp/raftkv-data",
+        &client_addr,
+        &data_dir,
+        &all_nodes,
     ) {
         Ok(s) => s,
         Err(e) => {
