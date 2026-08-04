@@ -3,7 +3,7 @@ use crate::raft::node::{Action, RaftNode};
 use crate::raft::state::NodeRole;
 use crate::storage::engine::StorageEngine;
 use crate::network::protocol::{Command, Response};
-
+use crate::sharding::router::{Router, ShardConfig};
 /// A complete cluster node: Raft consensus + storage engine.
 ///
 /// This is the integration layer that connects the pieces:
@@ -14,16 +14,11 @@ use crate::network::protocol::{Command, Response};
 ///
 /// In a multi-node setup, each physical server runs one ClusterNode.
 pub struct ClusterNode {
-    /// The Raft consensus module.
     pub raft: RaftNode,
-
-    /// The local storage engine (WAL + memtable).
     storage: StorageEngine,
-
-    /// Outbound messages queued for delivery to peer nodes.
-    /// The transport layer drains this queue and sends them over TCP.
-    /// Key: destination node ID. Value: list of serialized messages.
     pub outbound_messages: Vec<PeerMessage>,
+    router: Option<Router>,
+    shard_id: u64,
 }
 
 /// A message to be sent to a peer node.
@@ -51,7 +46,6 @@ impl ClusterNode {
         peers: Vec<u64>,
         data_dir: &str,
     ) -> std::io::Result<Self> {
-        // Each node gets its own subdirectory for storage
         let storage_dir = format!("{}/storage", data_dir);
         let storage = StorageEngine::new(&storage_dir)?;
 
@@ -61,6 +55,32 @@ impl ClusterNode {
             raft,
             storage,
             outbound_messages: Vec::new(),
+            router: None,
+            shard_id: 1, // Default shard
+        })
+    }
+
+    /// Create a cluster node with sharding enabled.
+    pub fn with_sharding(
+        node_id: u64,
+        peers: Vec<u64>,
+        data_dir: &str,
+        shard_id: u64,
+        shard_configs: Vec<ShardConfig>,
+    ) -> std::io::Result<Self> {
+        let storage_dir = format!("{}/storage", data_dir);
+        let storage = StorageEngine::new(&storage_dir)?;
+
+        let raft = RaftNode::with_persistence(node_id, peers, data_dir)?;
+
+        let router = Router::new(shard_configs, 64);
+
+        Ok(ClusterNode {
+            raft,
+            storage,
+            outbound_messages: Vec::new(),
+            router: Some(router),
+            shard_id,
         })
     }
 
@@ -72,6 +92,16 @@ impl ClusterNode {
     pub fn handle_client_command(&mut self, command: Command) -> Response {
         match command {
             Command::Get { key } => {
+                if let Some(ref router) = self.router {
+                    if !router.key_belongs_to_shard(&key, self.shard_id) {
+                        let target_shard = router.get_shard_id(&key)
+                            .unwrap_or(0);
+                        return Response::Error(
+                            format!("MOVED - key belongs to shard {}", target_shard)
+                        );
+                    }
+                }
+
                 match self.storage.get(&key) {
                     Some(value) => Response::BulkString(value),
                     None => Response::Null,
@@ -79,14 +109,23 @@ impl ClusterNode {
             }
 
             Command::Set { key, value } => {
-                // Only the leader can accept writes
+                // Check if this key belongs to our shard
+                if let Some(ref router) = self.router {
+                    if !router.key_belongs_to_shard(&key, self.shard_id) {
+                        let target_shard = router.get_shard_id(&key)
+                            .unwrap_or(0);
+                        return Response::Error(
+                            format!("MOVED - key belongs to shard {}", target_shard)
+                        );
+                    }
+                }
+
                 if self.raft.state.role != NodeRole::Leader {
                     return Response::Error(
                         "NOTLEADER - this node is not the leader".to_string()
                     );
                 }
 
-                // Propose through Raft
                 let command = LogCommand::Put { key, value };
                 match self.raft.propose(command) {
                     Some(actions) => {
@@ -100,6 +139,16 @@ impl ClusterNode {
             }
 
             Command::Del { key } => {
+                if let Some(ref router) = self.router {
+                    if !router.key_belongs_to_shard(&key, self.shard_id) {
+                        let target_shard = router.get_shard_id(&key)
+                            .unwrap_or(0);
+                        return Response::Error(
+                            format!("MOVED - key belongs to shard {}", target_shard)
+                        );
+                    }
+                }
+
                 if self.raft.state.role != NodeRole::Leader {
                     return Response::Error(
                         "NOTLEADER - this node is not the leader".to_string()
@@ -117,7 +166,6 @@ impl ClusterNode {
                     }
                 }
             }
-
             Command::Ping => {
                 Response::SimpleString("PONG".to_string())
             }

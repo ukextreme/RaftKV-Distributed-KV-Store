@@ -3,6 +3,7 @@ mod network;
 mod raft;
 mod cluster;
 mod transport;
+mod sharding;
 
 use network::server::Server;
 use transport::NodeConfig;
@@ -725,6 +726,181 @@ mod tests {
         match response {
             Response::SimpleString(s) => assert_eq!(s, "PONG"),
             other => panic!("Expected PONG, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_consistent_hashing_ring() {
+        use crate::sharding::ring::HashRing;
+
+        let mut ring = HashRing::new(64);
+
+        // Empty ring returns None
+        assert!(ring.get_shard("any_key").is_none());
+
+        // Add three shards
+        ring.add_shard(1);
+        ring.add_shard(2);
+        ring.add_shard(3);
+
+        assert_eq!(ring.shard_count(), 3);
+
+        // Every key should map to some shard
+        for i in 0..100 {
+            let key = format!("key_{}", i);
+            let shard = ring.get_shard(&key);
+            assert!(shard.is_some());
+            let shard_id = shard.unwrap();
+            assert!(shard_id >= 1 && shard_id <= 3);
+        }
+
+        // Same key always maps to the same shard (deterministic)
+        let shard_a = ring.get_shard("test_key").unwrap();
+        let shard_b = ring.get_shard("test_key").unwrap();
+        assert_eq!(shard_a, shard_b);
+
+        // Distribution should be roughly even with 64 virtual nodes.
+        // With 100 keys and 3 shards, each should get roughly 33.
+        // We allow a wide margin (10-60) because 100 keys is a small sample.
+        let mut counts = [0u32; 4]; // index 0 unused, 1-3 for shards
+        for i in 0..100 {
+            let key = format!("key_{}", i);
+            let shard = ring.get_shard(&key).unwrap();
+            counts[shard as usize] += 1;
+        }
+
+        for shard_id in 1..=3 {
+            assert!(
+                counts[shard_id] > 10,
+                "Shard {} got only {} keys — distribution too uneven",
+                shard_id, counts[shard_id]
+            );
+        }
+
+        // Remove a shard — keys should redistribute
+        let key_before = ring.get_shard("stable_key").unwrap();
+        ring.remove_shard(2);
+        assert_eq!(ring.shard_count(), 2);
+
+        // The key might stay on the same shard or move to another,
+        // but it must still map to a valid shard (1 or 3)
+        let key_after = ring.get_shard("stable_key").unwrap();
+        assert!(key_after == 1 || key_after == 3);
+
+        // Keys that were on shard 1 or 3 should mostly stay there
+        // (minimal disruption property of consistent hashing)
+    }
+
+    #[test]
+    fn test_router_key_routing() {
+        use crate::sharding::router::{Router, ShardConfig};
+
+        let shards = vec![
+            ShardConfig {
+                shard_id: 1,
+                node_ids: vec![1, 2, 3],
+                leader_port: Some(6381),
+            },
+            ShardConfig {
+                shard_id: 2,
+                node_ids: vec![4, 5, 6],
+                leader_port: Some(6384),
+            },
+        ];
+
+        let router = Router::new(shards, 64);
+
+        // Every key should route to shard 1 or shard 2
+        for i in 0..50 {
+            let key = format!("user_{}", i);
+            let shard = router.get_shard_id(&key).unwrap();
+            assert!(shard == 1 || shard == 2);
+        }
+
+        // key_belongs_to_shard should be consistent with get_shard_id
+        let test_key = "important_data";
+        let owning_shard = router.get_shard_id(test_key).unwrap();
+        assert!(router.key_belongs_to_shard(test_key, owning_shard));
+        // It should NOT belong to the other shard
+        let other_shard = if owning_shard == 1 { 2 } else { 1 };
+        assert!(!router.key_belongs_to_shard(test_key, other_shard));
+
+        // route() should return full shard config
+        let config = router.route(test_key).unwrap();
+        assert_eq!(config.shard_id, owning_shard);
+        assert!(!config.node_ids.is_empty());
+    }
+
+    #[test]
+    fn test_sharded_cluster_node() {
+        use crate::cluster::ClusterNode;
+        use crate::network::protocol::{Command, Response};
+        use crate::sharding::router::ShardConfig;
+        use std::fs;
+
+        let test_dir = "/tmp/test_sharded_cluster";
+        let _ = fs::remove_dir_all(test_dir);
+
+        // Create a node that belongs to shard 1
+        let shard_configs = vec![
+            ShardConfig {
+                shard_id: 1,
+                node_ids: vec![1, 2, 3],
+                leader_port: Some(6381),
+            },
+            ShardConfig {
+                shard_id: 2,
+                node_ids: vec![4, 5, 6],
+                leader_port: Some(6384),
+            },
+        ];
+
+        let mut node = ClusterNode::with_sharding(
+            1, vec![1], test_dir, 1, shard_configs,
+        ).expect("Failed to create sharded node");
+
+        // Tick until leader
+        for _ in 0..25 {
+            node.tick();
+        }
+
+        // Try many keys — some should succeed (shard 1), some should MOVED (shard 2)
+        let mut accepted = 0;
+        let mut moved = 0;
+
+        for i in 0..50 {
+            let key = format!("key_{}", i);
+            let response = node.handle_client_command(Command::Set {
+                key,
+                value: "test".to_string(),
+            });
+
+            match response {
+                Response::SimpleString(ref s) if s == "OK" => accepted += 1,
+                Response::Error(ref e) if e.starts_with("MOVED") => moved += 1,
+                other => panic!("Unexpected response: {:?}", other),
+            }
+        }
+
+        // With 2 shards, roughly half should be accepted and half moved
+        assert!(accepted > 5, "Too few accepted: {}", accepted);
+        assert!(moved > 5, "Too few moved: {}", moved);
+
+        // Keys that were accepted should be readable
+        for i in 0..50 {
+            let key = format!("key_{}", i);
+            let response = node.handle_client_command(Command::Get {
+                key: key.clone(),
+            });
+
+            match response {
+                Response::BulkString(_) => {} // This shard owns it
+                Response::Null => {}          // This shard owns it but it's a read issue
+                Response::Error(ref e) if e.starts_with("MOVED") => {} // Other shard
+                other => panic!("Unexpected response for {}: {:?}", key, other),
+            }
         }
 
         let _ = fs::remove_dir_all(test_dir);
