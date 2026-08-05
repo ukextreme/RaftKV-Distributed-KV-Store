@@ -50,8 +50,8 @@ pub enum Action {
 /// Configuration for timeout behavior.
 /// In a real system these would be milliseconds.
 /// Here they're in "ticks" — each call to tick() is one tick.
-const ELECTION_TIMEOUT_MIN: u64 = 10;
-const ELECTION_TIMEOUT_MAX: u64 = 20;
+const ELECTION_TIMEOUT_MIN: u64 = 30;
+const ELECTION_TIMEOUT_MAX: u64 = 60;
 const HEARTBEAT_INTERVAL: u64 = 3;
 
 /// The core Raft node.
@@ -230,9 +230,11 @@ impl RaftNode {
     /// 3. Reset election timeout (in case we need to retry)
     /// 4. Send RequestVote to all other nodes
     fn start_election(&mut self) -> Vec<Action> {
+        
         // Transition to candidate — increments term, votes for self
         self.state.become_candidate();
-
+        println!("Node {} starting election for term {}",
+                 self.state.id, self.state.current_term);
         // Track our own vote
         self.votes_received.clear();
         self.votes_received.insert(self.state.id);
@@ -246,9 +248,12 @@ impl RaftNode {
 
         // Check if we're the only node (single-node cluster)
         // If so, we already have a majority (1 out of 1)
-        if self.state.peers.len() == 1 {
+        if self.votes_received.len() >= self.state.majority_count() {
+            println!("Node {} WON election for term {} with {} votes",
+                     self.state.id, self.state.current_term, self.votes_received.len());
             self.state.become_leader();
-            return actions;
+            self.heartbeat_timeout = 0;
+            return self.send_heartbeats();
         }
 
         // Send RequestVote to every other node
@@ -301,7 +306,7 @@ impl RaftNode {
         request: RequestVoteRequest,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
-
+        println!("Node {} received vote request from node {} for term {}",self.state.id, request.candidate_id, request.term);
         // Rule 1: If the candidate's term is less than ours,
         // they're stale — reject immediately.
         if request.term < self.state.current_term {
@@ -385,6 +390,7 @@ impl RaftNode {
         from: u64,
         response: RequestVoteResponse,
     ) -> Vec<Action> {
+        println!("Node {} received vote response from node {}: granted={}",self.state.id, from, response.vote_granted);
         // If we're no longer a candidate (maybe we already won,
         // or stepped down), ignore the response.
         if self.state.role != NodeRole::Candidate {

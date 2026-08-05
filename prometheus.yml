@@ -1,0 +1,18 @@
+# Prometheus configuration
+# Scrapes metrics from all three raftkv nodes every 5 seconds.
+
+global:
+  scrape_interval: 5s       # How often to collect metrics
+  evaluation_interval: 5s   # How often to evaluate alerting rules
+
+scrape_configs:
+  - job_name: 'raftkv'
+    # Static targets: the three node metrics endpoints.
+    # In Docker Compose, nodes are reachable by service name.
+    static_configs:
+      - targets:
+          - 'node1:9101'
+          - 'node2:9102'
+          - 'node3:9103'
+        labels:
+          cluster: 'raftkv-demo'

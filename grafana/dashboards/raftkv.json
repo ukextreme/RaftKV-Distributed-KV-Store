@@ -1,0 +1,116 @@
+{
+  "id": null,
+  "uid": "raftkv-cluster",
+  "title": "RaftKV Cluster Dashboard",
+  "tags": ["raftkv", "raft", "distributed"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Node Roles",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "raftkv_role",
+          "legendFormat": "Node {{node}} ({{role}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "Follower", "color": "blue" } }, "type": "value" },
+            { "options": { "1": { "text": "Candidate", "color": "yellow" } }, "type": "value" },
+            { "options": { "2": { "text": "Leader", "color": "green" } }, "type": "value" }
+          ],
+          "thresholds": {
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Current Term",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "raftkv_current_term",
+          "legendFormat": "Node {{node}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Is Leader",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "raftkv_is_leader",
+          "legendFormat": "Node {{node}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Commit Index",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "raftkv_commit_index",
+          "legendFormat": "Node {{node}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Log Length",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "raftkv_log_length",
+          "legendFormat": "Node {{node}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Last Applied",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "raftkv_last_applied",
+          "legendFormat": "Node {{node}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Known Leader",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "raftkv_known_leader",
+          "legendFormat": "Node {{node}} sees leader"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 30,
+  "version": 1
+}

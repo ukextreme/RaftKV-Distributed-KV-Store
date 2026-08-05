@@ -3,7 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-
+use crate::metrics;
 use crate::cluster::ClusterNode;
 use crate::transport::{NodeConfig, PeerTransport};
 use super::protocol::{Command, Response};
@@ -15,6 +15,7 @@ pub struct Server {
     transport: PeerTransport,
     peer_port: u16,
     node_id: u64,
+    all_nodes: Vec<NodeConfig>,
 }
 
 impl Server {
@@ -42,16 +43,25 @@ impl Server {
             transport,
             peer_port,
             node_id,
+            all_nodes: all_nodes.to_vec(),
         })
     }
 
     /// Start the server: peer listener + tick thread + client accept loop.
     pub fn run(&self) -> std::io::Result<()> {
+        // === START THE METRICS SERVER ===
+        let metrics_port = 9100 + self.node_id as u16;
+        metrics::start_metrics_server(
+            metrics_port,
+            self.node_id,
+            Arc::clone(&self.node),
+        );
         // === START THE PEER LISTENER ===
         PeerTransport::start_listener(
             self.node_id,
             self.peer_port,
             Arc::clone(&self.node),
+            self.all_nodes.clone(),
         )?;
 
         // === START THE TICK THREAD ===
@@ -69,7 +79,7 @@ impl Server {
             let transport = PeerTransport::from_addresses(tick_node_id, peer_addresses);
 
             loop {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(100));
 
                 let messages = {
                     let mut node = tick_node.lock().unwrap();

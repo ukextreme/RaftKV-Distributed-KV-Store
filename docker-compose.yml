@@ -1,0 +1,84 @@
+# Docker Compose configuration for a 3-node raftkv cluster
+# with Prometheus monitoring and Grafana dashboards.
+#
+# Usage:
+#   docker compose up --build      (start everything)
+#   docker compose down            (stop everything)
+#   docker compose up --build -d   (start in background)
+
+services:
+  # === Database Nodes ===
+
+  node1:
+    build: .
+    command: ["1"]
+    environment:
+      - RAFTKV_HOST=0.0.0.0
+      - PEER_HOST_1=node1
+      - PEER_HOST_2=node2
+      - PEER_HOST_3=node3
+    ports:
+      - "6381:6381"   # Client port
+      - "9101:9101"   # Metrics port
+    volumes:
+      - node1-data:/data
+
+  node2:
+    build: .
+    command: ["2"]
+    environment:
+      - RAFTKV_HOST=0.0.0.0
+      - PEER_HOST_1=node1
+      - PEER_HOST_2=node2
+      - PEER_HOST_3=node3
+    ports:
+      - "6382:6382"
+      - "9102:9102"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    build: .
+    command: ["3"]
+    environment:
+      - RAFTKV_HOST=0.0.0.0
+      - PEER_HOST_1=node1
+      - PEER_HOST_2=node2
+      - PEER_HOST_3=node3
+    ports:
+      - "6383:6383"
+      - "9103:9103"
+    volumes:
+      - node3-data:/data
+
+  # === Monitoring ===
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - node1
+      - node2
+      - node3
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

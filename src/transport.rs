@@ -66,11 +66,16 @@ impl PeerTransport {
     pub fn new(node_id: u64, all_nodes: &[NodeConfig]) -> Self {
         let mut peer_addresses = HashMap::new();
 
+        // Check for environment variable overrides (for Docker)
         for config in all_nodes {
             if config.id != node_id {
+                let host_var = format!("PEER_HOST_{}", config.id);
+                let host = std::env::var(&host_var)
+                    .unwrap_or_else(|_| "127.0.0.1".to_string());
+
                 peer_addresses.insert(
                     config.id,
-                    format!("127.0.0.1:{}", config.peer_port),
+                    format!("{}:{}", host, config.peer_port),
                 );
             }
         }
@@ -96,10 +101,9 @@ impl PeerTransport {
         for msg in messages {
             let addr = match self.peer_addresses.get(&msg.to) {
                 Some(addr) => addr.clone(),
-                None => continue, // Unknown peer, skip
+                None => continue,
             };
 
-            // Convert PeerMessage to NetworkMessage
             let network_msg = match msg.payload {
                 MessagePayload::RequestVote(req) => {
                     NetworkMessage::RequestVote {
@@ -127,26 +131,36 @@ impl PeerTransport {
                 }
             };
 
-            // Serialize to JSON
             let json = match serde_json::to_string(&network_msg) {
                 Ok(j) => j,
                 Err(_) => continue,
             };
 
-            // Connect and send. If anything fails, skip silently.
-            // Raft handles message loss gracefully — the leader
-            // retries, elections retry, nothing depends on a single
-            // message getting through.
-            if let Ok(mut stream) = TcpStream::connect_timeout(
-                &addr.parse().unwrap(),
-                Duration::from_millis(100),
-            ) {
-                let line = format!("{}\n", json);
-                let _ = stream.write_all(line.as_bytes());
-                let _ = stream.flush();
-            }
-            // Connection failure is normal — the peer might be down.
-            // Raft tolerates this by design.
+            // Spawn a thread for each send so that a dead node
+            // doesn't block messages to live nodes.
+            // Without this, connecting to the dead node blocks
+            // for the timeout duration, and by then the live
+            // node has already started a new election.
+            thread::spawn(move || {
+                use std::net::ToSocketAddrs;
+
+                let sock_addr = match addr.to_socket_addrs() {
+                    Ok(mut addrs) => match addrs.next() {
+                        Some(a) => a,
+                        None => return,
+                    },
+                    Err(_) => return,
+                };
+
+                if let Ok(mut stream) = TcpStream::connect_timeout(
+                    &sock_addr,
+                    Duration::from_millis(50),
+                ) {
+                    let line = format!("{}\n", json);
+                    let _ = stream.write_all(line.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
         }
     }
 
@@ -159,23 +173,28 @@ impl PeerTransport {
         node_id: u64,
         peer_port: u16,
         cluster_node: Arc<Mutex<ClusterNode>>,
+        all_nodes: Vec<NodeConfig>,
     ) -> std::io::Result<()> {
-        let addr = format!("127.0.0.1:{}", peer_port);
+        let addr = format!("0.0.0.0:{}", peer_port);
         let listener = TcpListener::bind(&addr)?;
 
         println!("Node {} peer listener on {}", node_id, addr);
 
-        // Set non-blocking would complicate things; instead,
-        // we spawn a thread that blocks on accept.
+        // Create a transport for sending responses immediately
+        let transport = PeerTransport::new(node_id, &all_nodes);
+
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let stream = match stream {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        // Set a read timeout so we don't block forever
+                        // waiting for more data on a closed connection
+                        s.set_read_timeout(Some(Duration::from_millis(500))).ok();
+                        s
+                    }
                     Err(_) => continue,
                 };
 
-                // Read one message per connection
-                // (our send side connects, sends one message, closes)
                 let reader = BufReader::new(stream);
 
                 for line in reader.lines() {
@@ -188,7 +207,6 @@ impl PeerTransport {
                         continue;
                     }
 
-                    // Parse the JSON message
                     let msg: NetworkMessage = match serde_json::from_str(&line) {
                         Ok(m) => m,
                         Err(e) => {
@@ -197,9 +215,18 @@ impl PeerTransport {
                         }
                     };
 
-                    // Lock the cluster node and dispatch the message
-                    let mut node = cluster_node.lock().unwrap();
-                    Self::dispatch_message(&mut node, msg);
+                    // Lock, process, drain messages, then unlock BEFORE sending
+                    let outbound = {
+                        let mut node = cluster_node.lock().unwrap();
+                        Self::dispatch_message(&mut node, msg);
+                        node.take_outbound_messages()
+                    };
+                    // Lock released here
+
+                    // Send outbound messages IMMEDIATELY — don't wait for tick thread
+                    if !outbound.is_empty() {
+                        transport.send_messages(outbound);
+                    }
                 }
             }
         });
