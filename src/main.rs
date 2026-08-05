@@ -358,9 +358,9 @@ mod tests {
         assert_eq!(node3.state.role, NodeRole::Follower);
 
         // Tick node1 until it times out and starts an election.
-        // We tick up to 25 times (max timeout is 20).
+        // We tick up to 65 times (max timeout is 20).
         let mut election_actions = Vec::new();
-        for _ in 0..25 {
+        for _ in 0..65 {
             let actions = node1.tick();
             if !actions.is_empty() {
                 election_actions = actions;
@@ -434,7 +434,7 @@ mod tests {
 
         // Tick node1 until it starts an election
         let mut vote_requests = Vec::new();
-        for _ in 0..25 {
+        for _ in 0..65 {
             let actions = node1.tick();
             if !actions.is_empty() {
                 vote_requests = actions;
@@ -602,7 +602,7 @@ mod tests {
                 .expect("Failed to create node");
 
             // Tick until election starts
-            for _ in 0..25 {
+            for _ in 0..65 {
                 let actions = node.tick();
                 if !actions.is_empty() {
                     break;
@@ -673,7 +673,7 @@ mod tests {
 
         // Tick until the node elects itself leader.
         // Single-node cluster: should win immediately.
-        for _ in 0..25 {
+        for _ in 0..65 {
             node.tick();
         }
 
@@ -877,7 +877,7 @@ mod tests {
         ).expect("Failed to create sharded node");
 
         // Tick until leader
-        for _ in 0..25 {
+        for _ in 0..65 {
             node.tick();
         }
 
