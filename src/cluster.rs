@@ -19,6 +19,11 @@ pub struct ClusterNode {
     pub outbound_messages: Vec<PeerMessage>,
     router: Option<Router>,
     shard_id: u64,
+    /// Log index a write command just appended, if any. Raft only
+    /// guarantees a write once a majority has replicated it, so the
+    /// server must not reply OK until commit_index reaches this.
+    /// Cleared at the start of every command.
+    pub pending_commit_index: Option<usize>,
 }
 
 /// A message to be sent to a peer node.
@@ -57,6 +62,7 @@ impl ClusterNode {
             outbound_messages: Vec::new(),
             router: None,
             shard_id: 1, // Default shard
+            pending_commit_index: None,
         })
     }
 
@@ -81,6 +87,7 @@ impl ClusterNode {
             outbound_messages: Vec::new(),
             router: Some(router),
             shard_id,
+            pending_commit_index: None,
         })
     }
 
@@ -90,6 +97,7 @@ impl ClusterNode {
     /// - Reads go directly to the storage engine (fast, local)
     /// - Writes go through Raft (propose → replicate → commit → apply)
     pub fn handle_client_command(&mut self, command: Command) -> Response {
+        self.pending_commit_index = None;
         match command {
             Command::Get { key } => {
                 if let Some(ref router) = self.router {
@@ -130,6 +138,10 @@ impl ClusterNode {
                 match self.raft.propose(command) {
                     Some(actions) => {
                         self.process_actions(actions);
+                        // Appended locally, not yet committed. The server
+                        // holds the reply until a majority has it.
+                        self.pending_commit_index =
+                            Some(self.raft.state.log.last_index());
                         Response::SimpleString("OK".to_string())
                     }
                     None => {
@@ -159,6 +171,8 @@ impl ClusterNode {
                 match self.raft.propose(command) {
                     Some(actions) => {
                         self.process_actions(actions);
+                        self.pending_commit_index =
+                            Some(self.raft.state.log.last_index());
                         Response::Integer(1)
                     }
                     None => {
